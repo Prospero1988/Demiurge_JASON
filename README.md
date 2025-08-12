@@ -2,21 +2,23 @@
 
 <p align="center"><IMG SRC="IMG/logo.png", width="400px" /></p>
 
-## NMR or ECFP4-based QSPR Machine Learning Input Generator
+## NMR (based on JEOL JASON software)  or ECFP4-based QSPR Machine Learning Input Generator
 
 Demiurge is a modular and fully automated Python-based platform designed to generate machine learning input data from both simulated spectral and structural molecular representations. Specifically developed to support QSPR studies, it processes chemical structures provided as SMILES strings alongside target properties (e.g., CHI logD), and produces ready-to-use feature matrices for classical ML models and deep neural networks.
 
 The tool supports four representation modes: predicted **¹H NMR** spectra, **¹³C NMR** spectra, concatenated **¹H | ¹³C** spectral vectors and **ECFP4** molecular fingerprints. Input files in `.csv` format are validated for SMILES integrity and formatting. Molecular structures are reconstructed using **RDKit** or **obabel**, optimized in 3D, then flattened to 2D to comply with NMR prediction tools.
 
-NMR spectral predictions are performed locally using a standalone Java-based engine built on the **NMRshiftDB2** database, utilizing **HOSE-code** pattern matching. The resulting chemical shift lists are then transformed into fixed-length spectral vectors through a custom bucketing strategy (200 bins per nucleus, but can be changed in bucketing module script), enabling compatibility with ML pipelines. In the fused representation, the 1H and 13C vectors are joined together head to tail.
+NMR spectral predictions are performed locally with **JEOL JASON** (commercial, proprietary software by JEOL Ltd.), accessed programmatically via the `BeautifulJASON` Python API. The resulting chemical shift lists are then transformed into fixed-length spectral vectors through a custom bucketing strategy (200 bins per nucleus, but can be changed in bucketing module script), enabling compatibility with ML pipelines. In the fused representation, the 1H and 13C vectors are joined together head to tail.
+
+[Link to JASON website](https://www.jeoljason.com/)
+
+[Link to BeautifulJASON project page](https://pypi.org/project/beautifuljason/)
+
 
 For ECFP4 generation, **RDKit's Morgan fingerprinting** (radius = 2) is used to construct 2048-bit binary descriptors. All generated feature matrices are merged with property labels (e.g., CHI logD), headers are appended, and the final datasets are saved as `.csv` files.
 
-Demiurge is optimized for parallel execution on 8-core CPUs, achieving processing times of ~6 minutes for ¹H NMR spectra, ~15 minutes for ¹³C NMR, and under 2 minutes for ECFP4 on datasets of ~1000 molecules.
-
 The architecture is fully extensible and easily adaptable to other endpoints such as **logP**, **TPSA**, or **logS**, and to other types of spectral or molecular representations.
 
-The tool uses the NMRshiftDB2 predictor, which can be accessed [here](https://sourceforge.net/p/nmrshiftdb2/wiki/PredictorJars/).
 
 ## 🖥 Examples of Working Program
 
@@ -45,7 +47,7 @@ The script was run as an example for the prediction of 13C NMR spectra with an i
 ## 💡Key Features
 
 - **Molecule Generation**: Converts SMILES codes into 3D molecular structures and saves them as flattened 2D `.mol` files using RDKit.
-- **NMR Spectrum Prediction**: Predicts NMR spectra for each molecule using a custom Java-based [NMRshiftDB2](https://sourceforge.net/p/nmrshiftdb2/wiki/PredictorJars/) predictor.
+- **NMR Spectrum Prediction**: NMR spectral predictions are performed locally with **JEOL JASON** (commercial, proprietary software by JEOL Ltd.), accessed programmatically via the `BeautifulJASON` Python API.
 - **ECFP4 Fingerprints Generation**: Generates feature space using ECPF4 fingerprints with radius 2. (activated via --predictor FP)
 - **Bucketization**: Converts predicted NMR spectra into a uniform matrix using a bucketing technique.
 - **Data Merging**: Merges the bucketized spectra/fingerprints with property labels to form a consolidated dataset.
@@ -80,9 +82,33 @@ Ensure the following software and libraries are installed:
 2. **Open Babel**
    Open Babel is needed to process "exotic" structures that standard RDKit library can not process. Make sure the `obabel` command is available in your system's PATH.
 
-3. **Java SDK**:
-   - Java Development Kit (JDK) is required to compile and run the Java batch processor for NMR spectrum prediction. Make sure the `javac` and `java` commands are available in your system's PATH.
+3. **JEOL JASON (commercial) + BeautifulJASON API**
 
+   > **Requirement:** JEOL **JASON** is **commercial, proprietary software** by **JEOL Ltd.**  
+   > You must have a valid license (or request a time-limited trial from JEOL) to use it.
+
+   - **Install JEOL JASON**
+     - Download and install JASON from JEOL (license or trial required).
+     - Launch JASON once to complete activation.
+
+   - **Install the Python API (BeautifulJASON)**
+     ```bash
+     # activate your environment first, e.g.:
+     # conda activate predictor_logD
+
+     pip install beautifuljason
+     ```
+     
+   - **Point BeautifulJASON to your JASON installation (if not auto-detected)**
+     ```bash
+     # Show current configuration (path, version, license info)
+     jason_config --display
+
+     # If JASON is not found, set the application path manually:
+     # Windows example:
+     jason_config --set-app "C:\Program Files\JEOL\JASON\JASON.exe"
+
+     
 ### ✅ Conda Environment
 
 If you prefer to use Conda - utilize the provided environment file to create your Conda environment:
@@ -92,15 +118,14 @@ conda env create -f conda_environment.yml
 conda activate predictor_logD
 ```
 
-Then Download & Install Java SDK (tested on version 23). Ensure java and javac are accessible in your PATH. 
 
 ## ⚙️ Installation
 
 Clone the repository from GitHub and navigate to the project directory:
 
 ```bash
-git clone https://github.com/Prospero1988/Demiurge.git
-cd Demiurge
+git clone https://github.com/Prospero1988/Demiurge_JASON.git
+cd Demiurge_JASON
 ```
 
 ### 🗂 Directory Structure
@@ -113,13 +138,8 @@ demiurge/
 ├── demiurge.py                    # Main script for executing the pipeline
 ├── input_example.csv              # Example of the input file
 ├── install_modules.py             # Installs required Python packages
-├── predictor/
-│   ├── predictorh.jar             # Java-based predictor for 1H spectra [NMRshiftDB2]
-│   ├── predictor13C.jar           # Java-based predictor for 13C spectra [NMRshiftDB2]
-│   ├── cdk-2.9.jar                # CDK library required for spectrum prediction.
-│   ├── BatchProcessor1H.java      # Java batch processor for 1H spectra [NMRshiftDB2]
-│   └── BatchProcessor13C.java     # Java batch processor for 13C spectra [NMRshiftDB2]
-├── logD_predictor_bin/            # Directory containing helper modules
+├── demiurge_bin/                  # Directory containing helper modules
+│   ├── predictor_JASON.py         # Module to predict 1H or 13C spectra based on JEOL JASON Software
 │   ├── csv_checker.py             # Verifies and preprocesses CSV files
 │   ├── concatenator.py            # Concatenate 1H and 13C matrices into new fused matrix
 │   ├── gen_mols.py                # Generates .mol files from SMILES strings
@@ -215,8 +235,10 @@ Example `test.csv`:
 1. **Step 1: Generate `.mol` Files**:
    - Reads SMILES codes from the input CSV file and generates corresponding `.mol` files using RDKit.
 
-2. **Step 2: Predict NMR Spectra**:
-   - Uses the Java-based `BatchProcessor1H` or `BatchProcessor13C` to predict NMR spectra for each molecule. Predictor is part of [NMRshiftDB2](https://sourceforge.net/p/nmrshiftdb2/wiki/PredictorJars/) database.
+2. **Step 2: Predict NMR Spectra**  
+   - Uses **JEOL JASON** (commercial, proprietary software by JEOL Ltd.) to predict NMR spectra for each molecule.  
+   - Predictions are executed programmatically via the **BeautifulJASON** Python API, which communicates directly with the installed JASON application.  
+   - The chemical-shift prediction engine built into JASON is used to generate ¹H or ¹³C spectra for subsequent processing.
 
 3. **Step 3: Bucketize Spectra**:
    - Converts the predicted spectra into a uniform bucketized matrix for easy analysis and machine learning input generation.
@@ -236,8 +258,10 @@ Example `test.csv`:
 1. **Step 1: Generate `.mol` Files**:
    - Reads SMILES codes from the input CSV file and generates corresponding `.mol` files using RDKit.
 
-2. **Step 2: Predict NMR Spectra**:
-   - Uses the Java-based `BatchProcessor1H` or `BatchProcessor13C` to predict NMR spectra for each molecule. Predictor is part of [NMRshiftDB2](https://sourceforge.net/p/nmrshiftdb2/wiki/PredictorJars/) database.
+2. **Step 2: Predict NMR Spectra**  
+   - Uses **JEOL JASON** (commercial, proprietary software by JEOL Ltd.) to predict NMR spectra for each molecule.  
+   - Predictions are executed programmatically via the **BeautifulJASON** Python API, which communicates directly with the installed JASON application.  
+   - The chemical-shift prediction engine built into JASON is used to generate ¹H or ¹³C spectra for subsequent processing.
 
 3. **Step 3: Bucketize Spectra**:
    - Converts the predicted spectra into a uniform bucketized matrix for easy analysis and machine learning input generation.
@@ -276,9 +300,47 @@ Example `test.csv`:
 
 ## 🛠 Troubleshooting
 
-1. **Java Compilation Issues**:
-   - Ensure that the `javac` and `java` commands are available and the Java SDK is installed.
-   - If `javac` is not recognized, check the system's `PATH` variable and make sure it includes the path to the JDK `bin` directory.
+1. **JEOL JASON Setup Issues**
+   - Ensure **JEOL JASON** is installed, activated, and licensed.  
+     Launch the application once to complete activation.
+   - Install the Python binding (**BeautifulJASON**) in the same environment as your code:
+     ```bash
+     pip install beautifuljason
+     ```
+   - Verify that BeautifulJASON can locate the JASON application:
+     ```bash
+     jason_config --display
+     ```
+     If the application is not detected, set the path explicitly:
+     ```bash
+     # Windows
+     jason_config --set-app "C:\Program Files\JEOL\JASON\JASON.exe"
+     # macOS
+     jason_config --set-app "/Applications/JASON.app"
+     # Linux (if applicable in your setup)
+     jason_config --set-app "/opt/JASON/JASON"
+     ```
+   - Load all plugins when creating a session (missing plugins can lead to empty `Molecules` groups):
+     ```python
+     import beautifuljason as bjason
+     j = bjason.JASON(plugins=None)  # load all plugins
+     ```
+   - Smoke test: confirm a `.mol` is actually imported
+     ```python
+     import os
+     import beautifuljason as bjason
+
+     test_mol = "example.mol"  # replace with a real, small MOL file
+     j = bjason.JASON(plugins=None)
+     with j.create_document(os.path.abspath(test_mol), rules="off") as doc:
+         mols = list(doc.mol_data)
+         assert mols, "No molecules imported—check plugins, path, license, or the MOL file integrity."
+         print(f"OK: imported {len(mols)} molecule(s).")
+     ```
+   - Common errors & fixes:
+     - `object 'Molecules' doesn't exist` or `doc.mol_data` is empty → use `plugins=None`, verify the file path and format (`.mol`/`.sdf`), ensure JASON is activated/licensed, try an SDF export if needed.
+     - “Application not found” → run `jason_config --set-app ...` and re-check with `jason_config --display`.
+     - Headless/remote environments → JASON must be installed locally; GUI/desktop availability may be required depending on your OS and license model.
 
 2. **Missing Dependencies**:
    - Ensure that all required Python libraries (`rdkit`, `pandas`, and `numpy`) are installed.
@@ -288,10 +350,23 @@ Example `test.csv`:
 
 4. **Memory or Performance Issues**:
    - If handling a large dataset, consider increasing the memory allocation for the Java runtime by adjusting the `-Xmx` parameter in the script.
-
+  
+     
 ## 📜 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License — see the [LICENSE](LICENSE) file for details.
+
+> **Third-party software notice**  
+> The project integrates with **JEOL JASON** (commercial, proprietary software by **JEOL Ltd.**).  
+> **JASON is not included** and **requires a separate license** (or a time-limited trial) obtained from JEOL.  
+> You must install and activate JASON to use the prediction features.
+
+> **Python API**  
+> Access from Python is provided via **BeautifulJASON** (`beautifuljason`), which is distributed and licensed **separately**.  
+> Refer to that package’s own documentation and license for terms.
+
+Trademarks and product names are the property of their respective owners. This repository contains only glue code; no JEOL binaries or license keys are distributed.
+
 
 ---
 
