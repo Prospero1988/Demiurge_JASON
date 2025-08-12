@@ -10,7 +10,8 @@ modules = [
     ('pandas', 'pandas'),
     ('art', 'art'),
     ('numpy', 'numpy'),
-    ('rdkit', 'rdkit')
+    ('rdkit', 'rdkit'),
+    ('beautifuljason', 'beautifuljason')
 ]
 
 # Function to check and install a module

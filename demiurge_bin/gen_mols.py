@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Generate 2 D MOL files from SMILES strings.
+Generate 2 D MOL files from SMILES strings. (parallel version)
 
-Pipeline
---------
+Pipeline (jak w oryginale)
+--------------------------
 1.  Canonicalise the SMILES.
 2.  Add explicit hydrogens.
 3.  Try to embed a 3 D conformer with ETKDG (3 retries).
@@ -25,17 +26,19 @@ Notes
 
 from __future__ import annotations
 
+import argparse
 import os
 import subprocess
 import sys
 import tempfile
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 import pandas as pd
 from rdkit import Chem, RDLogger
 from rdkit.Chem import AllChem, rdCoordGen
 
-# Silence all RDKit log output (optional but recommended)
+# Silence all RDKit log output (also in workers via _worker_init)
 RDLogger.DisableLog("rdApp.*")
 
 # ──────────────────────────────────────────────────────────────
@@ -52,8 +55,27 @@ EMBED_RANDOM_SEED = 42
 
 
 # ──────────────────────────────────────────────────────────────
-# Helper functions
+# Helper functions (pure / picklable)
 # ──────────────────────────────────────────────────────────────
+def print_progress(current: int, total: int) -> None:
+    """Draw a coloured, in-place ASCII progress bar."""
+    filled = int(PROGRESS_BAR_LEN * current / max(1, total))
+    bar = ANSI_GREEN + "█" * filled + "-" * (PROGRESS_BAR_LEN - filled) + ANSI_RESET
+    percent = int(100 * current / max(1, total))
+    sys.stdout.write(f"\rProgress: |{bar}| {current}/{total} ({percent}%)")
+    sys.stdout.flush()
+    if current >= total:
+        print()  # newline
+
+
+def canonical_smiles(smiles: str) -> str:
+    """Return RDKit-canonical SMILES or raise *ValueError*."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles}")
+    return Chem.MolToSmiles(mol, canonical=True)
+
+
 def safe_embed_molecule(
     mol: Chem.Mol,
     max_retries: int = MAX_ETKDG_RETRIES,
@@ -85,12 +107,44 @@ def safe_embed_molecule(
         return None, f"ETKDG + CoordGen failed: {exc}"
 
 
-def has_hypervalent_sulphur(mol: Chem.Mol) -> bool:
-    """Return *True* if the molecule contains S with total valence > 4."""
-    return any(
-        atom.GetSymbol() == "S" and atom.GetTotalValence() > 4
-        for atom in mol.GetAtoms()
-    )
+EXOTIC_VALENCE_LIMITS = {"S": 4, "P": 4, "As": 4, "Se": 4}
+TRANSITION_METALS = {21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
+                     39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+                     57, 72, 73, 74, 75, 76, 77, 78, 79}
+
+def needs_openbabel(mol: Chem.Mol, smiles: str, warn_msg: Optional[str]) -> Tuple[bool, List[str]]:
+    """Heurystyka kiedy wymusić OpenBabel."""
+    reasons: List[str] = []
+
+    # hyper-valent chalcogens / pnictogens
+    if any(
+        a.GetSymbol() in EXOTIC_VALENCE_LIMITS
+        and a.GetTotalValence() > EXOTIC_VALENCE_LIMITS[a.GetSymbol()]
+        for a in mol.GetAtoms()
+    ):
+        reasons.append("exotic valence (S/P/As/Se)")
+
+    # transition metals
+    if any(a.GetAtomicNum() in TRANSITION_METALS for a in mol.GetAtoms()):
+        reasons.append("transition metal")
+
+    # radicals
+    if any(a.GetNumRadicalElectrons() for a in mol.GetAtoms()):
+        reasons.append("radical")
+
+    # very large molecules
+    if mol.GetNumHeavyAtoms() > 150:
+        reasons.append("very large molecule")
+
+    # dot-SMILES
+    if "." in smiles:
+        reasons.append("dot-SMILES")
+
+    # ETKDG fail earlier
+    if warn_msg:
+        reasons.append("ETKDG failure")
+
+    return (len(reasons) > 0), reasons
 
 
 def openbabel_fallback(rdkit_mol: Chem.Mol, out_path: str) -> Tuple[bool, str | None]:
@@ -118,83 +172,88 @@ def openbabel_fallback(rdkit_mol: Chem.Mol, out_path: str) -> Tuple[bool, str | 
         return False, exc.stderr.decode().strip()
 
 
-def canonical_smiles(smiles: str) -> str:
-    """Return RDKit-canonical SMILES or raise *ValueError*."""
-    mol = Chem.MolFromSmiles(smiles)
-    if mol is None:
-        raise ValueError(f"Invalid SMILES: {smiles}")
-    return Chem.MolToSmiles(mol, canonical=True)
-
-
-def print_progress(current: int, total: int) -> None:
-    """Draw a coloured, in-place ASCII progress bar."""
-    filled = int(PROGRESS_BAR_LEN * current / total)
-    bar = ANSI_GREEN + "█" * filled + "-" * (PROGRESS_BAR_LEN - filled) + ANSI_RESET
-    percent = int(100 * current / total)
-    sys.stdout.write(f"\rProgress: |{bar}| {current}/{total} ({percent}%)")
-    sys.stdout.flush()
-    if current == total:
-        print()  # newline
-
-
 # ──────────────────────────────────────────────────────────────
-# Extra “weird‑chemistry” detectors
+# Worker side
 # ──────────────────────────────────────────────────────────────
-EXOTIC_VALENCE_LIMITS = {"S": 4, "P": 4, "As": 4, "Se": 4}
-TRANSITION_METALS = {21, 22, 23, 24, 25, 26, 27, 28, 29, 30,
-                     39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
-                     57, 72, 73, 74, 75, 76, 77, 78, 79}
+def _worker_init() -> None:
+    """Initialize per-process state (silence RDKit)."""
+    RDLogger.DisableLog("rdApp.*")
 
-def needs_openbabel(mol: Chem.Mol) -> bool:
+
+def _process_one(
+    name: str,
+    raw_smiles: str,
+    strict_mode: bool,
+    output_dir: str,
+) -> Tuple[bool, str, Optional[str]]:
     """
-    Return True for molecules that should bypass RDKit-only handling.
-    Triggers:
-        • hyper-valent S/P/As/Se
-        • any transition metal
-        • radicals
-        • too many heavy atoms (> 150)
-        • dot-disconnected SMILES fragments
+    Przerób jedną cząsteczkę → zapisz .mol.
+    Returns: (success, warning_text_or_None, error_text_or_None)
     """
-    # hyper‑valent chalcogens / pnictogens
-    if any(
-        a.GetSymbol() in EXOTIC_VALENCE_LIMITS
-        and a.GetTotalValence() > EXOTIC_VALENCE_LIMITS[a.GetSymbol()]
-        for a in mol.GetAtoms()
-    ):
-        return True
+    try:
+        smiles = canonical_smiles(raw_smiles)
+        mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
 
-    # transition metals
-    if any(a.GetAtomicNum() in TRANSITION_METALS for a in mol.GetAtoms()):
-        return True
+        # RDKit embedding
+        mol, warn_msg = safe_embed_molecule(mol)
+        if mol is None:
+            raise ValueError(warn_msg)
 
-    # radicals
-    if any(a.GetNumRadicalElectrons() for a in mol.GetAtoms()):
-        return True
+        # 3D sanity (strict mode)
+        if strict_mode:
+            conf = mol.GetConformer()
+            if all(conf.GetAtomPosition(i).Length() < 0.1 for i in range(mol.GetNumAtoms())):
+                raise ValueError("All atoms at origin (invalid 3D)")
 
-    # very large molecules
-    if mol.GetNumHeavyAtoms() > 150:
-        return True
+        # Decide if we force OpenBabel
+        force_babel, reason_list = needs_openbabel(mol, smiles, warn_msg)
 
-    return False
+        # Flatten copy to 2D; (jak w oryginale – linie 2D zostawione jako komentarz)
+        mol2d = Chem.Mol(mol)
+        # AllChem.Compute2DCoords(mol2d)
+        # Chem.RemoveStereochemistry(mol2d)
 
+        out_path = os.path.join(output_dir, f"{name}.mol")
 
-def is_dot_smiles(smiles: str) -> bool:
-    """True if SMILES contains disconnected fragments (“dot-SMILES”)."""
-    return "." in smiles
+        if not force_babel:
+            with open(out_path, "w", encoding="utf-8") as handle:
+                handle.write(Chem.MolToMolBlock(mol2d, forceV3000=True))
+        else:
+            ok, ob_err = openbabel_fallback(mol2d, out_path)
+            if not ok:
+                raise ValueError(f"OpenBabel fallback failed: {ob_err}")
+
+        warn_text = None
+        if warn_msg or force_babel:
+            parts = []
+            if warn_msg:
+                parts.append(warn_msg)
+            if force_babel:
+                parts.append("OpenBabel fallback → " + ", ".join(reason_list))
+            warn_text = f"{name}: " + " | ".join(parts)
+
+        return True, warn_text, None
+
+    except Exception as exc:  # pylint: disable=broad-except
+        err = f"Molecule: {name}\nSMILES: {raw_smiles}\nError: {exc}\n"
+        return False, None, err
+
 
 # ──────────────────────────────────────────────────────────────
-# Main routine
+# Public API (parallel)
 # ──────────────────────────────────────────────────────────────
-def generate_mol_files(csv_path: str, strict_mode: bool = True) -> str:
+def generate_mol_files(csv_path: str, strict_mode: bool = True, workers: Optional[int] = None) -> str:
     """
-    Convert SMILES in *csv_path* to flat MOL files.
+    Convert SMILES in *csv_path* to flat MOL files (parallel).
 
     Parameters
     ----------
-    csv_path
+    csv_path : str
         CSV with columns ``MOLECULE_NAME`` and ``SMILES``.
-    strict_mode
+    strict_mode : bool
         If *True*, reject molecules whose 3D coords all sit at (0, 0, 0).
+    workers : Optional[int]
+        Number of parallel workers (default: all available CPUs).
 
     Returns
     -------
@@ -204,85 +263,47 @@ def generate_mol_files(csv_path: str, strict_mode: bool = True) -> str:
     output_dir = os.path.join(os.getcwd(), "mols")
     os.makedirs(output_dir, exist_ok=True)
 
-    errors: List[str] = []
-    warnings: List[str] = []
-
     data = pd.read_csv(csv_path)
     data = data.drop_duplicates(subset="MOLECULE_NAME", keep="first")
 
-    total = len(data)
-    last_update = 0
+    jobs: List[Tuple[str, str]] = [
+        (row.MOLECULE_NAME, row.SMILES) for row in data.itertuples(index=False)
+    ]
+
+    total = len(jobs)
+    if total == 0:
+        print(f"{ANSI_ORANGE}No rows in CSV after de-duplication by MOLECULE_NAME.{ANSI_RESET}")
+        return output_dir
+
+    # Auto-detect workers; clamp to [1, total]
+    if workers is None or workers <= 0:
+        workers = os.cpu_count() or 1
+    workers = max(1, min(workers, total))
+
+    print("\nGenerating *.mol files …")
+    print(f"Using {ANSI_ORANGE}{workers}{ANSI_RESET} parallel workers")
+    print_progress(0, total)
+
+    errors: List[str] = []
+    warnings: List[str] = []
     saved_files = 0
+    done = 0
 
-    print("\nGenerating *.mol files …\n")
-
-    for idx, row in enumerate(data.itertuples(index=False), start=1):
-        name, raw_smiles = row.MOLECULE_NAME, row.SMILES
-        try:
-            smiles = canonical_smiles(raw_smiles)
-            mol = Chem.AddHs(Chem.MolFromSmiles(smiles))
-
-            # ── RDKit embedding ───────────────────────────────────────────
-            mol, warn_msg = safe_embed_molecule(mol)
-            if mol is None:
-                raise ValueError(warn_msg)
-            if warn_msg:
-                warnings.append(f"{name}: {warn_msg}")
-
-            # ---------- Decide if this molecule must go through OpenBabel -------------
-            force_babel = False
-            reason_list: List[str] = []
-
-            if needs_openbabel(mol):
-                force_babel = True
-                reason_list.append("exotic atom / metal / radical / size")
-
-            if is_dot_smiles(smiles):
-                force_babel = True
-                reason_list.append("dot-SMILES (disconnected fragments)")
-
-            if warn_msg:          # ETKDG failed earlier → CoordGen only
-                force_babel = True
-                reason_list.append("ETKDG failure")
-
-            if force_babel:
-                warnings.append(f"{name}: OpenBabel fallback → {', '.join(reason_list)}")
-
-            # ── Basic 3D sanity check ───────────────────────────────────
-            conf = mol.GetConformer()
-            if all(conf.GetAtomPosition(i).Length() < 0.1 for i in range(mol.GetNumAtoms())):
-                raise ValueError("All atoms at origin (invalid 3D)")
-
-            # ── Flatten copy to 2D; strip wedge bonds ───────────────────
-            mol2d = Chem.Mol(mol)
-            AllChem.Compute2DCoords(mol2d)
-            Chem.RemoveStereochemistry(mol2d)
-
-            out_path = os.path.join(output_dir, f"{name}.mol")
-
-            # ── Write via RDKit or OpenBabel ─────────────────────────────
-            if not force_babel:
-                with open(out_path, "w", encoding="utf-8") as handle:
-                    handle.write(Chem.MolToMolBlock(mol2d, forceV3000=True))
-            else:
-                success, ob_error = openbabel_fallback(mol2d, out_path)
-                if not success:
-                    raise ValueError(f"OpenBabel fallback failed: {ob_error}")
-
-            saved_files += 1
-
-        except Exception as exc:  # pylint: disable=broad-except
-            errors.append(
-                f"Molecule: {name}\nSMILES: {raw_smiles}\nError: {exc}\n"
-            )
-
-        # ── Progress bar update ─────────────────────────────────────────
-        progress = (idx / total) * 100
-        if idx != total and progress - last_update >= 1:
-            print_progress(idx, total)
-            last_update = progress
-
-    print_progress(total, total)
+    with ProcessPoolExecutor(max_workers=workers, initializer=_worker_init) as ex:
+        futures = [
+            ex.submit(_process_one, name, smiles, strict_mode, output_dir)
+            for (name, smiles) in jobs
+        ]
+        for fut in as_completed(futures):
+            ok, warn_txt, err_txt = fut.result()
+            if ok:
+                saved_files += 1
+            if warn_txt:
+                warnings.append(warn_txt)
+            if err_txt:
+                errors.append(err_txt)
+            done += 1
+            print_progress(done, total)
 
     # ── Write logs ─────────────────────────────────────────────────────
     if errors:
@@ -301,3 +322,21 @@ def generate_mol_files(csv_path: str, strict_mode: bool = True) -> str:
         print(f"{ANSI_ORANGE}See 'mol_creation_warning.log' for fallbacks.{ANSI_RESET}")
 
     return output_dir
+
+
+# ──────────────────────────────────────────────────────────────
+# Optional CLI
+# ──────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate V3000 .mol files from SMILES (parallel).")
+    parser.add_argument("--csv", required=True, help="Path to CSV with MOLECULE_NAME and SMILES columns.")
+    parser.add_argument("--no-strict", action="store_true", help="Disable strict 3D sanity check.")
+    parser.add_argument("--workers", type=int, default=None, help="Number of parallel workers (default: all CPUs).")
+    args = parser.parse_args()
+
+    out_dir = generate_mol_files(
+        csv_path=args.csv,
+        strict_mode=not args.no_strict,
+        workers=args.workers,
+    )
+    print(f"\nOutput folder: {out_dir}")

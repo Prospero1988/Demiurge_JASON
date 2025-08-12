@@ -24,12 +24,12 @@ def bucket(directory, predictor):
              ]
     RESET = '\033[0m'
     
-    number_of_buckets = 200
+    number_of_buckets = 250
     
     if predictor == "1H":
-        sw_min, sw_max = -1, 14
+        sw_min, sw_max = -1, 18
     elif predictor == "13C":
-        sw_min, sw_max = -10, 230
+        sw_min, sw_max = -10, 250
 
     def create_buckets():
         bucket_range = np.linspace(sw_min, sw_max, number_of_buckets + 1)
